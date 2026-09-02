@@ -1,6 +1,6 @@
 # Chrome Hearts Instagram 新帖监控
 
-跑在 **GitHub Actions**（GitHub 的服务器）上，每 30 分钟检查一次 [@chromehearts](https://www.instagram.com/chromehearts/)，
+跑在 **GitHub Actions**（GitHub 的服务器）上，每 30 分钟检查一次 [@chromeheartsofficial](https://www.instagram.com/chromeheartsofficial/)，
 发现新帖就通过 **ntfy** 推到你手机。不依赖你的电脑开不开机。
 
 - `monitor.py` — 监控脚本（纯 Python 标准库，无需安装依赖）
@@ -11,7 +11,7 @@
 
 ## 一、手机装 ntfy（2 分钟）
 
-1. 手机应用商店搜 **ntfy**，安装（iOS / Android 都有，免��，不用注册）。
+1. 手机应用商店搜 **ntfy**，安装（iOS / Android 都有，免费，不用注册）。
 2. 打开 App → 点 **+** 订阅一个频道。频道名要**长、随机、别人猜不到**，比如：
 
    ```

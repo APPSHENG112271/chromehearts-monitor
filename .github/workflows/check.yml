@@ -25,7 +25,7 @@ jobs:
 
       - name: Run monitor
         env:
-          IG_ACCOUNT: chromehearts
+          IG_ACCOUNT: chromeheartsofficial
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
           IG_SESSIONID: ${{ secrets.IG_SESSIONID }}

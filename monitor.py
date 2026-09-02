@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ACCOUNT = os.environ.get("IG_ACCOUNT", "chromehearts").strip().lstrip("@")
+ACCOUNT = os.environ.get("IG_ACCOUNT", "chromeheartsofficial").strip().lstrip("@")
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").strip().rstrip("/") or "https://ntfy.sh"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 IG_SESSIONID = os.environ.get("IG_SESSIONID", "").strip()
