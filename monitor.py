@@ -21,6 +21,7 @@ import os
 import ssl
 import sys
 import time
+import random
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -36,14 +37,27 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
 
-def fetch_profile():
-    url = "https://i.instagram.com/api/v1/users/web_profile_info/?username=%s" % ACCOUNT
+HOSTS = ["www.instagram.com", "i.instagram.com"]
+
+
+def _fetch_once(host):
+    url = "https://%s/api/v1/users/web_profile_info/?username=%s" % (host, ACCOUNT)
     headers = {
         "User-Agent": UA,
         "X-IG-App-ID": IG_APP_ID,
+        "X-ASBD-ID": "129477",
+        "X-IG-WWW-Claim": "0",
+        "X-Requested-With": "XMLHttpRequest",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.instagram.com/%s/" % ACCOUNT,
+        "Origin": "https://www.instagram.com",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
     }
     if IG_SESSIONID:
         headers["Cookie"] = "sessionid=%s" % IG_SESSIONID
@@ -51,6 +65,24 @@ def fetch_profile():
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_profile():
+    last_err = None
+    for attempt in range(4):
+        for host in HOSTS:
+            try:
+                return _fetch_once(host)
+            except urllib.error.HTTPError as e:
+                last_err = e
+                if e.code not in (429, 500, 502, 503, 560):
+                    raise
+                print("[retry] %s HTTP %s (attempt %d)" % (host, e.code, attempt + 1), file=sys.stderr)
+            except Exception as e:
+                last_err = e
+                print("[retry] %s %s (attempt %d)" % (host, e, attempt + 1), file=sys.stderr)
+        time.sleep(6 * (attempt + 1) + random.uniform(0, 4))
+    raise last_err
 
 
 def parse_posts(data):
