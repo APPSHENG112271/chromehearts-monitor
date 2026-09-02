@@ -1,0 +1,45 @@
+name: chromehearts-monitor
+
+on:
+  schedule:
+    # 每 30 分钟一次（GitHub 高峰期可能会延迟几分钟到十几分钟，属正常）
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # 手动 "Run workflow" 按钮，用来测试
+
+permissions:
+  contents: write         # 允许把状态文件回写到仓库
+
+concurrency:
+  group: chromehearts-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run monitor
+        env:
+          IG_ACCOUNT: chromehearts
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+          IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
+          STATE_PATH: state/last_seen.json
+        run: python monitor.py
+
+      - name: Persist state
+        run: |
+          git add -A state/
+          if git diff --cached --quiet; then
+            echo "状态无变化，无需提交。"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "update last_seen state"
+            git push
+          fi
