@@ -29,6 +29,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
           IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           STATE_PATH: state/last_seen.json
         run: python monitor.py
 

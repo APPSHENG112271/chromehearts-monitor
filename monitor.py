@@ -30,6 +30,7 @@ ACCOUNT = os.environ.get("IG_ACCOUNT", "chromeheartsofficial").strip().lstrip("@
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").strip().rstrip("/") or "https://ntfy.sh"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 IG_SESSIONID = os.environ.get("IG_SESSIONID", "").strip()
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 STATE_PATH = Path(os.environ.get("STATE_PATH", "state/last_seen.json"))
 
 IG_APP_ID = "936619743392459"
@@ -63,7 +64,11 @@ def _fetch_once(host):
         headers["Cookie"] = "sessionid=%s" % IG_SESSIONID
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+    handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    if PROXY_URL:
+        handlers.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
