@@ -5,11 +5,15 @@ Chrome Hearts (Instagram) 新帖监控。
 检查目标账号的最新帖子，和上次记录比对，发现新帖就通过 ntfy 推到手机。
 只用 Python 标准库，无需 pip install。
 
+抓取走 DataImpulse 住宅代理，并强制美国出口（__cr.us + sticky sessid），
+每次运行先确认出口是 US 才去请求 IG，避免异地 IP 触发风控。
+
 环境变量：
-  IG_ACCOUNT     目标账号（默认 chromehearts）
+  IG_ACCOUNT     目标账号（默认 chromeheartsofficial）
   NTFY_TOPIC     ntfy 频道名（必填，才会推送）
   NTFY_SERVER    ntfy 服务器（默认 https://ntfy.sh）
-  IG_SESSIONID   Instagram 登录 cookie 的 sessionid（可选，强烈建议，抓取更稳）
+  IG_SESSIONID   Instagram 登录 cookie 的 sessionid（建议，抓取更稳）
+  PROXY_URL      住宅代理，形如 http://user__cr.us:pass@gw.dataimpulse.com:823
   STATE_PATH     状态文件路径（默认 state/last_seen.json）
 
 用法：
@@ -18,11 +22,12 @@ Chrome Hearts (Instagram) 新帖监控。
 """
 import json
 import os
+import random
 import ssl
 import sys
 import time
-import random
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -34,14 +39,40 @@ PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 STATE_PATH = Path(os.environ.get("STATE_PATH", "state/last_seen.json"))
 
 IG_APP_ID = "936619743392459"
+HOSTS = ["www.instagram.com", "i.instagram.com"]
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
 
-HOSTS = ["www.instagram.com", "i.instagram.com"]
+def _proxy_with_session(base, sessid):
+    """把 ;sessid.<x> 注入代理用户名，锁定同一个（美国）IP。"""
+    if not base:
+        return base
+    pr = urllib.parse.urlsplit(base)
+    user = (pr.username or "").split(";sessid.")[0]
+    pwd = pr.password or ""
+    host = pr.hostname or ""
+    port = (":%d" % pr.port) if pr.port else ""
+    user2 = "%s;sessid.%s" % (user, sessid)
+    return "%s://%s:%s@%s%s" % (pr.scheme, user2, pwd, host, port)
 
 
-def _fetch_once(host):
+def _opener_for(proxy_url):
+    ctx = ssl.create_default_context()
+    handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    if proxy_url:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    return urllib.request.build_opener(*handlers)
+
+
+def _country(opener):
+    try:
+        return opener.open("https://ipinfo.io/country", timeout=15).read().decode().strip()
+    except Exception:
+        return "?"
+
+
+def _fetch_ig(opener, host):
     url = "https://%s/api/v1/users/web_profile_info/?username=%s" % (host, ACCOUNT)
     headers = {
         "User-Agent": UA,
@@ -63,37 +94,46 @@ def _fetch_once(host):
     if IG_SESSIONID:
         headers["Cookie"] = "sessionid=%s" % IG_SESSIONID
     req = urllib.request.Request(url, headers=headers)
-    ctx = ssl.create_default_context()
-    handlers = [urllib.request.HTTPSHandler(context=ctx)]
-    if PROXY_URL:
-        handlers.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
-    opener = urllib.request.build_opener(*handlers)
     with opener.open(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def fetch_profile():
+    """多次尝试：每次拿一个美国 sticky 出口，确认 US 后再请求 IG。"""
     last_err = None
-    for attempt in range(4):
+    for attempt in range(6):
+        if PROXY_URL:
+            sessid = str(random.randint(10 ** 6, 10 ** 9))
+            opener = _opener_for(_proxy_with_session(PROXY_URL, sessid))
+            country = _country(opener)
+            if country != "US":
+                print("[retry] 出口国家=%s，换 IP (第 %d 次)" % (country, attempt + 1), file=sys.stderr)
+                time.sleep(2)
+                continue
+            print("[info] 美国出口就绪 sessid=%s" % sessid, file=sys.stderr)
+        else:
+            opener = _opener_for("")
         for host in HOSTS:
             try:
-                return _fetch_once(host)
+                return _fetch_ig(opener, host)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code not in (429, 500, 502, 503, 560):
                     raise
-                print("[retry] %s HTTP %s (attempt %d)" % (host, e.code, attempt + 1), file=sys.stderr)
+                print("[retry] %s HTTP %s (第 %d 次)" % (host, e.code, attempt + 1), file=sys.stderr)
             except Exception as e:
                 last_err = e
-                print("[retry] %s %s (attempt %d)" % (host, e, attempt + 1), file=sys.stderr)
-        time.sleep(6 * (attempt + 1) + random.uniform(0, 4))
-    raise last_err
+                print("[retry] %s %s (第 %d 次)" % (host, e, attempt + 1), file=sys.stderr)
+        time.sleep(5 * (attempt + 1) + random.uniform(0, 3))
+    if last_err:
+        raise last_err
+    raise RuntimeError("no attempt reached IG (代理一直不是美国出口?)")
 
 
 def parse_posts(data):
     user = (data or {}).get("data", {}).get("user")
     if not user:
-        return None  # 账号不存在 / 被拦 / 需要登录
+        return None
     edges = user.get("edge_owner_to_timeline_media", {}).get("edges", [])
     posts = []
     for e in edges:
@@ -126,13 +166,12 @@ def save_state(state):
 
 
 def push(title, body, click=None, priority="high", tags="shopping_bags"):
-    """通过 ntfy 推送。HTTP 头必须是 ASCII，所以中文只放在 body（body 是 UTF-8）。"""
     if not NTFY_TOPIC:
         print("[warn] 未设置 NTFY_TOPIC，跳过推送", file=sys.stderr)
         return
     url = "%s/%s" % (NTFY_SERVER, NTFY_TOPIC)
     req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST")
-    req.add_header("Title", title)          # ASCII only
+    req.add_header("Title", title)  # ASCII only
     req.add_header("Priority", priority)
     req.add_header("Tags", tags)
     if click:
@@ -152,7 +191,7 @@ def notify_new(post):
         cap = cap[:197] + "..."
     body = cap or ("新视频" if post["is_video"] else "新帖子")
     body = "@%s\n%s\n%s" % (ACCOUNT, body, link)
-    title = "New post from @%s" % ACCOUNT   # ASCII
+    title = "New post from @%s" % ACCOUNT  # ASCII
     push(title, body, click=link)
 
 
@@ -165,24 +204,12 @@ def main():
         return
 
     state = load_state()
-    print("[debug] PROXY set=%s len=%d | COOKIE set=%s len=%d" % (bool(PROXY_URL), len(PROXY_URL), bool(IG_SESSIONID), len(IG_SESSIONID)), file=sys.stderr)
-    try:
-        _ctx = ssl.create_default_context()
-        _h = [urllib.request.HTTPSHandler(context=_ctx)]
-        if PROXY_URL:
-            _h.append(urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
-        _op = urllib.request.build_opener(*_h)
-        _ip = _op.open("https://api.ipify.org", timeout=20).read().decode().strip()
-        print("[debug] exit_ip=%s" % _ip, file=sys.stderr)
-    except Exception as _e:
-        print("[debug] exit_ip_err=%s" % _e, file=sys.stderr)
     seen_max = int(state.get("max_ts", 0) or 0)
 
     try:
         data = fetch_profile()
     except urllib.error.HTTPError as e:
-        # 401/429 通常是被限流或需要登录 —— 不让整个 workflow 报红、也不刷屏推送
-        print("[error] 抓取失败 HTTP %s（可能被限流/需要 IG_SESSIONID）" % e.code, file=sys.stderr)
+        print("[error] 抓取失败 HTTP %s（可能被限流，稍后自动重试）" % e.code, file=sys.stderr)
         return
     except Exception as e:
         print("[error] 抓取失败: %s" % e, file=sys.stderr)
@@ -190,7 +217,7 @@ def main():
 
     posts = parse_posts(data)
     if posts is None:
-        print("[warn] 拿不到帖子（账号私密 / 被拦 / 需要登录）。建议配置 IG_SESSIONID。", file=sys.stderr)
+        print("[warn] 拿不到帖子（账号私密 / 被拦 / cookie 失效）", file=sys.stderr)
         return
     if not posts:
         print("[warn] 帖子列表为空。")
@@ -198,7 +225,6 @@ def main():
 
     newest_ts = max(p["ts"] for p in posts)
 
-    # 首次运行：只记录当前状态，不对已有帖子刷屏
     if not state:
         newest = max(posts, key=lambda p: p["ts"])
         save_state({"max_ts": newest_ts, "last_shortcode": newest["shortcode"],
@@ -206,7 +232,6 @@ def main():
         print("[seed] 已初始化到 %s (ts=%s)，首次不推送。" % (newest["shortcode"], newest_ts))
         return
 
-    # 只有 taken_at 时间戳比记录更新的才算新帖（这样置顶的老帖不会误报）
     new_posts = sorted([p for p in posts if p["ts"] > seen_max], key=lambda p: p["ts"])
     if not new_posts:
         print("[ok] 没有新帖 (max_ts=%s)" % seen_max)
