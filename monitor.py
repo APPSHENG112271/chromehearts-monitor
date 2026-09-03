@@ -165,6 +165,7 @@ def main():
         return
 
     state = load_state()
+    print("[debug] PROXY set=%s len=%d | COOKIE set=%s len=%d" % (bool(PROXY_URL), len(PROXY_URL), bool(IG_SESSIONID), len(IG_SESSIONID)), file=sys.stderr)
     seen_max = int(state.get("max_ts", 0) or 0)
 
     try:
