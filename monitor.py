@@ -101,7 +101,8 @@ def _fetch_ig(opener, host):
 def fetch_profile():
     """多次尝试：每次拿一个美国 sticky 出口，确认 US 后再请求 IG。"""
     last_err = None
-    for attempt in range(6):
+    # 被限流时重试太多只会让限流一直不消，所以每次运行只轻轻试 2 轮
+    for attempt in range(2):
         if PROXY_URL:
             sessid = str(random.randint(10 ** 6, 10 ** 9))
             opener = _opener_for(_proxy_with_session(PROXY_URL, sessid))
