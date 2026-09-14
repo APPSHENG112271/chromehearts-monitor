@@ -254,6 +254,7 @@
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789396286551/css/search.css",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/EswCss.css",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/global.css",
+    "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/homePage.css",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/search.css",
     "/privacy.html",
     "/scents",
@@ -279,5 +280,5 @@
     "/terms.html"
   ],
   "images": [],
-  "updated": 1789417603
+  "updated": 1789417675
 }
