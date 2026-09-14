@@ -238,6 +238,9 @@
     "/on/demandware.static/-/Sites-ch-storefront-catalog/en_US/v1789396286551/css/scents.css",
     "/on/demandware.static/-/Sites-ch-storefront-catalog/en_US/v1789396286551/css/underwear.css",
     "/on/demandware.static/-/Sites-ch-storefront-catalog/en_US/v1789396286551/intimates.css",
+    "/on/demandware.static/-/Sites-ch-storefront-catalog/en_US/v1789416825998/css/scents.css",
+    "/on/demandware.static/-/Sites-ch-storefront-catalog/en_US/v1789416825998/css/underwear.css",
+    "/on/demandware.static/-/Sites-ch-storefront-catalog/en_US/v1789416825998/intimates.css",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/default/dw40252987/images/favicons/favicon-32x32.ico",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/default/dw73d0356f/images/favicons/favicon-96x96.ico",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/default/dw772bec5c/images/favicons/favicon-16x16.ico",
@@ -249,6 +252,9 @@
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789396286551/css/global.css",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789396286551/css/homePage.css",
     "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789396286551/css/search.css",
+    "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/EswCss.css",
+    "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/global.css",
+    "/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v1789416825998/css/search.css",
     "/privacy.html",
     "/scents",
     "/scents/22-eau-de-parfum/162006CRYXXX271.html",
@@ -273,5 +279,5 @@
     "/terms.html"
   ],
   "images": [],
-  "updated": 1789413679
+  "updated": 1789417603
 }
