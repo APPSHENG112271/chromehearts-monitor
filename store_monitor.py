@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Chrome Hearts 官网上新监控（首页 + 自动发现的所有分类）。
+Chrome Hearts 官网监控（首页 + 自动发现的所有分类）。
 
-监控三类信号：
-  1. 新商品   —— 任何页面上出现没见过的商品 SKU
-  2. 新页面   —— 首页/导航里冒出新的分类或系列页（新 drop 常这样出现）
-  3. banner   —— 首页主视觉换图（默认关闭，WATCH_BANNER=1 打开）
+监控四类信号：
+  1. 新商品   —— 出现没见过的商品 SKU
+  2. 到货     —— 之前售罄的商品重新有货（RESTOCK）
+  3. 新页面   —— 首页/导航里冒出新的分类或系列页（新 drop 常这样出现）
+  4. banner   —— 首页主视觉换图（默认关闭，WATCH_BANNER=1 打开）
+
+售罄判定：页面里 <a class="soldout" href="..../SKU.html"> 即表示该 SKU 售罄。
 
 优先直连（省代理流量），被挡时自动改走美国住宅代理。只用 Python 标准库。
 
@@ -45,7 +48,8 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", "state/store_seen.json"))
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
-# 这些是固定页面，不当作"新页面"信号
+MAX_PUSH = 8   # 单次最多推这么多条，超了合并成一条，防刷屏
+
 STATIC_SKIP = {
     "/", "/login", "/cart", "/contact", "/account", "/search",
     "/terms.html", "/privacy.html", "/disclosure.html",
@@ -56,10 +60,8 @@ RE_HREF = re.compile(r'href=["\']([^"\']+)["\']', re.I)
 RE_IMG = re.compile(r'(?:src|data-src)=["\']([^"\']*demandware\.static[^"\']*)["\']', re.I)
 RE_PRODUCT = re.compile(r'^/[a-z0-9\-]+/[a-z0-9\-]+/([A-Za-z0-9]{6,})\.html$')
 RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
-# 只有这种形状才算"页面"：/collection 或 /collection/sub，不带扩展名
 RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
-MAX_PUSH = 8   # 单次运行最多推这么多条，超了就合并成一条，防刷屏
-FULL_SCAN_SEC = 1500   # 每 25 分钟才做一次全分类扫描；其余时间只刷首页
+RE_A_TAG = re.compile(r'<a\b[^>]*>', re.I)
 
 
 # ---------- 抓取 ----------
@@ -94,7 +96,6 @@ def _get(url, opener):
 
 
 def fetch(path):
-    """先直连，失败再走美国住宅代理。"""
     url = BASE + path if path.startswith("/") else path
     try:
         return _get(url, _opener(""))
@@ -114,40 +115,58 @@ def fetch(path):
 
 # ---------- 解析 ----------
 
+def _norm_path(href):
+    href = (href or "").strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    if href.startswith("http"):
+        pr = urllib.parse.urlsplit(href)
+        if pr.netloc and pr.netloc.lower() != HOST:
+            return None
+        path = pr.path
+    elif href.startswith("/"):
+        path = urllib.parse.urlsplit(href).path
+    else:
+        return None
+    path = re.sub(r"/+$", "", path) or "/"
+    return path if path.startswith("/") else None
+
+
 def internal_paths(html):
-    """页面里所有指向本站的链接，规范化成 /path（去掉参数和锚点）。"""
     out = set()
-    if not html:
-        return out
-    for href in RE_HREF.findall(html):
-        href = href.strip()
-        if href.startswith("//"):
-            href = "https:" + href
-        if href.startswith("http"):
-            pr = urllib.parse.urlsplit(href)
-            if pr.netloc and pr.netloc.lower() != HOST:
-                continue
-            path = pr.path
-        elif href.startswith("/"):
-            path = urllib.parse.urlsplit(href).path
-        else:
+    for href in RE_HREF.findall(html or ""):
+        p = _norm_path(href)
+        if p:
+            out.add(p)
+    return out
+
+
+def soldout_skus(html):
+    """页面里 <a class="soldout" href=".../SKU.html"> 对应的 SKU 集合。"""
+    out = set()
+    for tag in RE_A_TAG.findall(html or ""):
+        if not re.search(r'class=["\'][^"\']*\bsoldout\b', tag, re.I):
             continue
-        path = re.sub(r"/+$", "", path) or "/"
-        if path and path.startswith("/"):
-            out.add(path)
+        m = re.search(r'href=["\']([^"\']+)["\']', tag, re.I)
+        if not m:
+            continue
+        p = _norm_path(m.group(1))
+        if not p:
+            continue
+        pm = RE_PRODUCT.match(p)
+        if pm:
+            out.add(pm.group(1))
     return out
 
 
 def products_from(paths):
-    """从路径集合里挑出商品页，返回 {sku: {name, url, cat}}。"""
     found = {}
     for p in paths:
         m = RE_PRODUCT.match(p)
         if not m:
             continue
-        sku = m.group(1)
         parts = p.strip("/").split("/")
-        found[sku] = {
+        found[m.group(1)] = {
             "cat": parts[0],
             "name": parts[1].replace("-", " ").upper(),
             "url": BASE + p,
@@ -203,14 +222,14 @@ def push(title, body, click=None, priority="high", tags="shopping_bags"):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "testpush":
         push("Chrome Hearts store monitor - test",
-             "测试成功！官网首页或分类一上新，就会这样推给你，点开直达。",
+             "测试成功！上新 / 到货都会这样推给你，点开直达商品页。",
              click=BASE, priority="default")
         return
 
     state = load_state()
     known_products = state.get("products") or state.get("skus") or {}
     known_links = set(state.get("links") or [])
-    links_known = bool(state.get("links"))   # 旧版状态没有 links，首次记录时不推送
+    links_known = bool(state.get("links"))
     known_images = set(state.get("images") or [])
 
     home = fetch("/")
@@ -218,75 +237,98 @@ def main():
         print("[error] 首页抓不到，本次不更新状态", file=sys.stderr)
         return
 
+    htmls = [home]
     home_paths = internal_paths(home)
     cats = categories_from(home_paths)
     print("[info] 首页发现 %d 个分类: %s" % (len(cats), ", ".join(sorted(cats))))
 
-    all_paths = set(home_paths)
-    last_full = int(state.get("last_full_scan", 0) or 0)
-    do_full = (time.time() - last_full) > FULL_SCAN_SEC or not known_products
-    if do_full:
-        for cat in sorted(cats):
-            html = fetch(cat)
-            if html is None:
-                continue
-            paths = internal_paths(html)
-            all_paths |= paths
-            print("[info] %s: 抓到 %d 个商品" % (cat, len(products_from(paths))))
-            time.sleep(1)
-    else:
-        print("[info] 本次只刷首页（分类全扫每 %d 分钟一次）" % (FULL_SCAN_SEC // 60))
+    for cat in sorted(cats):
+        html = fetch(cat)
+        if html is None:
+            continue
+        htmls.append(html)
+        cp = internal_paths(html)
+        print("[info] %s: 商品 %d 个，售罄 %d 个"
+              % (cat, len(products_from(cp)), len(soldout_skus(html))))
+        time.sleep(1)
+
+    all_paths = set()
+    soldout_all = set()
+    for h in htmls:
+        all_paths |= internal_paths(h)
+        soldout_all |= soldout_skus(h)
 
     products = products_from(all_paths)
-    # 只把"真页面"当作链接信号，滤掉 css/js/图片等静态资源
+    for sku in products:
+        products[sku]["sold_out"] = sku in soldout_all
+
     page_paths = {p for p in all_paths
                   if RE_PAGE.match(p) and p not in STATIC_SKIP and "/on/" not in p}
-    print("[info] 合计商品 %d 个，页面 %d 个" % (len(products), len(page_paths)))
+    print("[info] 合计商品 %d 个（售罄 %d），页面 %d 个"
+          % (len(products), len(soldout_all), len(page_paths)))
 
-    if do_full and not products:
-        print("[error] 全扫没抓到任何商品（可能被挡或结构变了），本次不更新状态", file=sys.stderr)
+    if not products:
+        print("[error] 没抓到任何商品（可能被挡或结构变了），本次不更新状态", file=sys.stderr)
         return
 
     images = images_from(home) if WATCH_BANNER else set()
 
     # 首次运行：只记录，不推送
-    if not known_products and not known_links:
+    if not known_products and not links_known:
         save_state({"products": products, "links": sorted(page_paths),
-                    "last_full_scan": int(time.time()),
                     "images": sorted(images), "updated": int(time.time())})
-        print("[seed] 已记录 %d 个商品、%d 个页面，首次不推送。" % (len(products), len(page_paths)))
+        print("[seed] 已记录 %d 个商品（售罄 %d）、%d 个页面，首次不推送。"
+              % (len(products), len(soldout_all), len(page_paths)))
         return
 
-    # 先算出所有变化，再决定怎么推（防刷屏）
+    # 1) 新商品
     new_skus = [k for k in products if k not in known_products]
 
+    # 2) 到货：之前明确售罄，现在有货
+    restocked = []
+    for sku, pr in products.items():
+        prev = known_products.get(sku)
+        if not prev:
+            continue
+        if prev.get("sold_out") is True and pr["sold_out"] is False:
+            restocked.append(sku)
+
+    # 3) 新页面
     if links_known:
         new_links = [p for p in page_paths if p not in known_links]
     else:
         new_links = []
         print("[info] 首次记录页面清单，本次不推送新页面")
 
+    # 4) banner
     new_images = []
     if WATCH_BANNER and known_images:
         new_images = [i for i in images if i not in known_images]
 
-    total = len(new_skus) + len(new_links)
+    total = len(new_skus) + len(restocked) + len(new_links)
 
     if total == 0:
-        print("[ok] 没有变化（已知商品 %d 个）" % len(known_products))
+        print("[ok] 没有变化（已知商品 %d 个，其中售罄 %d）"
+              % (len(known_products), len(soldout_all)))
     elif total > MAX_PUSH:
-        # 变化太多（多半是网站改版），只发一条汇总，不刷屏
         print("[WARN] 一次出现 %d 处变化，合并成一条推送" % total)
         push("Chrome Hearts: %d changes" % total,
-             "官网出现 %d 处变化（新商品 %d、新页面 %d），可能是改版或大批上新：\n%s"
-             % (total, len(new_skus), len(new_links), BASE),
+             "官网出现 %d 处变化（新品 %d、到货 %d、新页面 %d）：\n%s"
+             % (total, len(new_skus), len(restocked), len(new_links), BASE),
              click=BASE)
     else:
         for sku in new_skus:
             pr = products[sku]
+            tag = "（售罄）" if pr["sold_out"] else ""
             print("[NEW-PRODUCT] %s %s %s" % (sku, pr["name"], pr["url"]))
             push("Chrome Hearts NEW: %s" % pr["cat"],
-                 "上新了！\n%s\n%s" % (pr["name"], pr["url"]), click=pr["url"])
+                 "上新了！%s\n%s\n%s" % (tag, pr["name"], pr["url"]), click=pr["url"])
+        for sku in restocked:
+            pr = products[sku]
+            print("[RESTOCK] %s %s %s" % (sku, pr["name"], pr["url"]))
+            push("Chrome Hearts RESTOCK: %s" % pr["cat"],
+                 "到货了！之前售罄的这件重新有货：\n%s\n%s" % (pr["name"], pr["url"]),
+                 click=pr["url"], tags="rotating_light")
         for pp in sorted(new_links):
             print("[NEW-PAGE] %s" % pp)
             push("Chrome Hearts NEW PAGE",
@@ -301,7 +343,6 @@ def main():
 
     known_products.update(products)
     save_state({"products": known_products,
-                "last_full_scan": int(time.time()) if do_full else last_full,
                 "links": sorted(set(known_links) | page_paths),
                 "images": sorted(set(known_images) | images),
                 "updated": int(time.time())})
