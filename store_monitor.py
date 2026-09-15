@@ -56,6 +56,9 @@ RE_HREF = re.compile(r'href=["\']([^"\']+)["\']', re.I)
 RE_IMG = re.compile(r'(?:src|data-src)=["\']([^"\']*demandware\.static[^"\']*)["\']', re.I)
 RE_PRODUCT = re.compile(r'^/[a-z0-9\-]+/[a-z0-9\-]+/([A-Za-z0-9]{6,})\.html$')
 RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
+# 只有这种形状才算"页面"：/collection 或 /collection/sub，不带扩展名
+RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
+MAX_PUSH = 8   # 单次运行最多推这么多条，超了就合并成一条，防刷屏
 
 
 # ---------- 抓取 ----------
@@ -231,7 +234,10 @@ def main():
         time.sleep(1)
 
     products = products_from(all_paths)
-    print("[info] 合计商品 %d 个，站内链接 %d 条" % (len(products), len(all_paths)))
+    # 只把"真页面"当作链接信号，滤掉 css/js/图片等静态资源
+    page_paths = {p for p in all_paths
+                  if RE_PAGE.match(p) and p not in STATIC_SKIP and "/on/" not in p}
+    print("[info] 合计商品 %d 个，页面 %d 个" % (len(products), len(page_paths)))
 
     if pages_ok == 0 or not products:
         print("[error] 没抓到任何商品（可能被挡或结构变了），本次不更新状态", file=sys.stderr)
@@ -241,48 +247,56 @@ def main():
 
     # 首次运行：只记录，不推送
     if not known_products and not known_links:
-        save_state({"products": products, "links": sorted(all_paths),
+        save_state({"products": products, "links": sorted(page_paths),
                     "images": sorted(images), "updated": int(time.time())})
-        print("[seed] 已记录 %d 个商品、%d 条链接，首次不推送。" % (len(products), len(all_paths)))
+        print("[seed] 已记录 %d 个商品、%d 个页面，首次不推送。" % (len(products), len(page_paths)))
         return
 
-    # 1) 新商品
-    new_skus = [s for s in products if s not in known_products]
-    for sku in new_skus:
-        p = products[sku]
-        print("[NEW-PRODUCT] %s %s %s" % (sku, p["name"], p["url"]))
-        push("Chrome Hearts NEW: %s" % p["cat"],
-             "上新了！\n%s\n%s" % (p["name"], p["url"]), click=p["url"])
+    # 先算出所有变化，再决定怎么推（防刷屏）
+    new_skus = [k for k in products if k not in known_products]
 
-    # 2) 新页面 / 新分类
     if links_known:
-        new_links = [p for p in all_paths
-                     if p not in known_links and p not in STATIC_SKIP and not RE_PRODUCT.match(p)]
+        new_links = [p for p in page_paths if p not in known_links]
     else:
         new_links = []
-        print("[info] 首次记录站内链接，本次不推送新页面")
-    for p in sorted(new_links):
-        print("[NEW-PAGE] %s" % p)
-        push("Chrome Hearts NEW PAGE",
-             "官网出现新页面（可能是新系列/新 drop）：\n%s%s" % (BASE, p),
-             click=BASE + p)
+        print("[info] 首次记录页面清单，本次不推送新页面")
 
-    # 3) banner 变化（可选）
     new_images = []
-    if WATCH_BANNER:
+    if WATCH_BANNER and known_images:
         new_images = [i for i in images if i not in known_images]
-        if new_images and known_images:
-            print("[NEW-BANNER] %d 张新图" % len(new_images))
-            push("Chrome Hearts homepage changed",
-                 "官网首页主视觉换了，可能有新动作：\n%s" % BASE,
-                 click=BASE, priority="default")
 
-    if not new_skus and not new_links and not new_images:
+    total = len(new_skus) + len(new_links)
+
+    if total == 0:
         print("[ok] 没有变化（已知商品 %d 个）" % len(known_products))
+    elif total > MAX_PUSH:
+        # 变化太多（多半是网站改版），只发一条汇总，不刷屏
+        print("[WARN] 一次出现 %d 处变化，合并成一条推送" % total)
+        push("Chrome Hearts: %d changes" % total,
+             "官网出现 %d 处变化（新商品 %d、新页面 %d），可能是改版或大批上新：\n%s"
+             % (total, len(new_skus), len(new_links), BASE),
+             click=BASE)
+    else:
+        for sku in new_skus:
+            pr = products[sku]
+            print("[NEW-PRODUCT] %s %s %s" % (sku, pr["name"], pr["url"]))
+            push("Chrome Hearts NEW: %s" % pr["cat"],
+                 "上新了！\n%s\n%s" % (pr["name"], pr["url"]), click=pr["url"])
+        for pp in sorted(new_links):
+            print("[NEW-PAGE] %s" % pp)
+            push("Chrome Hearts NEW PAGE",
+                 "官网出现新页面（可能是新系列/新 drop）：\n%s%s" % (BASE, pp),
+                 click=BASE + pp)
+
+    if new_images:
+        print("[NEW-BANNER] %d 张新图" % len(new_images))
+        push("Chrome Hearts homepage changed",
+             "官网首页主视觉换了，可能有新动作：\n%s" % BASE,
+             click=BASE, priority="default")
 
     known_products.update(products)
     save_state({"products": known_products,
-                "links": sorted(set(known_links) | all_paths),
+                "links": sorted(set(known_links) | page_paths),
                 "images": sorted(set(known_images) | images),
                 "updated": int(time.time())})
 
