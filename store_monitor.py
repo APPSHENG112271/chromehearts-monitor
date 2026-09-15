@@ -59,6 +59,7 @@ RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
 # 只有这种形状才算"页面"：/collection 或 /collection/sub，不带扩展名
 RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
 MAX_PUSH = 8   # 单次运行最多推这么多条，超了就合并成一条，防刷屏
+FULL_SCAN_SEC = 1500   # 每 25 分钟才做一次全分类扫描；其余时间只刷首页
 
 
 # ---------- 抓取 ----------
@@ -222,16 +223,19 @@ def main():
     print("[info] 首页发现 %d 个分类: %s" % (len(cats), ", ".join(sorted(cats))))
 
     all_paths = set(home_paths)
-    pages_ok = 1
-    for cat in sorted(cats):
-        html = fetch(cat)
-        if html is None:
-            continue
-        pages_ok += 1
-        paths = internal_paths(html)
-        all_paths |= paths
-        print("[info] %s: 抓到 %d 个商品" % (cat, len(products_from(paths))))
-        time.sleep(1)
+    last_full = int(state.get("last_full_scan", 0) or 0)
+    do_full = (time.time() - last_full) > FULL_SCAN_SEC or not known_products
+    if do_full:
+        for cat in sorted(cats):
+            html = fetch(cat)
+            if html is None:
+                continue
+            paths = internal_paths(html)
+            all_paths |= paths
+            print("[info] %s: 抓到 %d 个商品" % (cat, len(products_from(paths))))
+            time.sleep(1)
+    else:
+        print("[info] 本次只刷首页（分类全扫每 %d 分钟一次）" % (FULL_SCAN_SEC // 60))
 
     products = products_from(all_paths)
     # 只把"真页面"当作链接信号，滤掉 css/js/图片等静态资源
@@ -239,8 +243,8 @@ def main():
                   if RE_PAGE.match(p) and p not in STATIC_SKIP and "/on/" not in p}
     print("[info] 合计商品 %d 个，页面 %d 个" % (len(products), len(page_paths)))
 
-    if pages_ok == 0 or not products:
-        print("[error] 没抓到任何商品（可能被挡或结构变了），本次不更新状态", file=sys.stderr)
+    if do_full and not products:
+        print("[error] 全扫没抓到任何商品（可能被挡或结构变了），本次不更新状态", file=sys.stderr)
         return
 
     images = images_from(home) if WATCH_BANNER else set()
@@ -248,6 +252,7 @@ def main():
     # 首次运行：只记录，不推送
     if not known_products and not known_links:
         save_state({"products": products, "links": sorted(page_paths),
+                    "last_full_scan": int(time.time()),
                     "images": sorted(images), "updated": int(time.time())})
         print("[seed] 已记录 %d 个商品、%d 个页面，首次不推送。" % (len(products), len(page_paths)))
         return
@@ -296,6 +301,7 @@ def main():
 
     known_products.update(products)
     save_state({"products": known_products,
+                "last_full_scan": int(time.time()) if do_full else last_full,
                 "links": sorted(set(known_links) | page_paths),
                 "images": sorted(set(known_images) | images),
                 "updated": int(time.time())})
