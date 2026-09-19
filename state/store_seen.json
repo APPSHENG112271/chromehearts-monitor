@@ -28,7 +28,7 @@
       "cat": "scents",
       "name": "22 SCENTED CANDLE 220G",
       "url": "https://www.chromehearts.com/scents/22-scented-candle-220g/162045CRYXXX273.html",
-      "sold_out": false
+      "sold_out": true
     },
     "176354XXXXXXXXX": {
       "cat": "socks",
@@ -249,5 +249,5 @@
     "/socks"
   ],
   "images": [],
-  "updated": 1789780967
+  "updated": 1789798517
 }
