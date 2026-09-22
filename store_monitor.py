@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Chrome Hearts 官网监控（首页 + 自动发现的所有分类）。
+Chrome Hearts 官网监控。
 
-监控四类信号：
+监控信号：
   1. 新商品   —— 出现没见过的商品 SKU
   2. 到货     —— 之前售罄的商品重新有货（RESTOCK）
-  3. 新页面   —— 首页/导航里冒出新的分类或系列页（新 drop 常这样出现）
+  3. 新页面   —— 冒出新的分类/系列页
   4. banner   —— 首页主视觉换图（默认关闭，WATCH_BANNER=1 打开）
 
-售罄判定：页面里 <a class="soldout" href="..../SKU.html"> 即表示该 SKU 售罄。
+分类发现（三路合并，避免漏掉不在首页导航里的分类）：
+  a) 首页导航
+  b) /shop 页面（含 cgid=XXX 形式，转换成 /xxx 规范地址）
+  c) 网站自己的 sitemap
 
-优先直连（省代理流量），被挡时自动改走美国住宅代理。只用 Python 标准库。
+商品链接兼容两种形状：
+  /分类/名字/SKU.html   和   /名字/SKU.html
 
-环境变量：
-  NTFY_TOPIC     ntfy 频道名（必填，才会推送）
-  NTFY_SERVER    ntfy 服务器（默认 https://ntfy.sh）
-  PROXY_URL      住宅代理（可选，直连失败时备用）
-  WATCH_BANNER   设为 1 时，首页图片变化也通知
-  STATE_PATH     状态文件（默认 state/store_seen.json）
+售罄判定：<a class="soldout" href=".../SKU.html">
 
-用法：
-  python store_monitor.py            检查一次
-  python store_monitor.py testpush   发测试通知
+遵守 robots.txt：不抓 /on/demandware.store/... 这类被禁止的地址，
+改用其规范别名（cgid=SWEATPANTS -> /sweatpants）。
+
+环境变量：NTFY_TOPIC / NTFY_SERVER / PROXY_URL / WATCH_BANNER / STATE_PATH
+用法：python store_monitor.py [testpush]
 """
 import json
 import os
@@ -48,20 +49,34 @@ STATE_PATH = Path(os.environ.get("STATE_PATH", "state/store_seen.json"))
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
-MAX_PUSH = 8   # 单次最多推这么多条，超了合并成一条，防刷屏
+MAX_PUSH = 8
 
 STATIC_SKIP = {
-    "/", "/login", "/cart", "/contact", "/account", "/search",
+    "/", "/login", "/cart", "/checkout", "/contact", "/account", "/search",
     "/terms.html", "/privacy.html", "/disclosure.html",
-    "/general.html", "/locations.html", "/magazine.html",
+    "/general.html", "/locations.html", "/magazine.html", "/shop",
 }
 
 RE_HREF = re.compile(r'href=["\']([^"\']+)["\']', re.I)
 RE_IMG = re.compile(r'(?:src|data-src)=["\']([^"\']*demandware\.static[^"\']*)["\']', re.I)
-RE_PRODUCT = re.compile(r'^/[a-z0-9\-]+/[a-z0-9\-]+/([A-Za-z0-9]{6,})\.html$')
-RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
-RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
 RE_A_TAG = re.compile(r'<a\b[^>]*>', re.I)
+RE_CGID = re.compile(r'cgid=([A-Za-z0-9_\-]+)', re.I)
+RE_LOC = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>', re.I)
+# 商品：1~2 段目录 + SKU.html（SKU 至少 9 位、含数字）
+RE_PRODUCT = re.compile(r'^/(?:[A-Za-z0-9\-]+/){1,2}([A-Za-z0-9]{9,})\.html$')
+# 分类/页面：1~2 段、不带扩展名
+RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
+RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
+
+
+def sku_from_path(p):
+    m = RE_PRODUCT.match(p or "")
+    if not m:
+        return None
+    sku = m.group(1)
+    if not re.search(r'\d', sku):
+        return None
+    return sku
 
 
 # ---------- 抓取 ----------
@@ -99,6 +114,10 @@ def fetch(path):
     url = BASE + path if path.startswith("/") else path
     try:
         return _get(url, _opener(""))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        print("[info] %s 直连失败(HTTP %s)，改走代理" % (path, e.code), file=sys.stderr)
     except Exception as e:
         print("[info] %s 直连失败(%s)，改走代理" % (path, e), file=sys.stderr)
     if not PROXY_URL:
@@ -141,8 +160,17 @@ def internal_paths(html):
     return out
 
 
+def cgid_categories(html):
+    """把 cgid=SWEATPANTS 这类转成规范地址 /sweatpants（避开 robots 禁止的原始链接）。"""
+    out = set()
+    for cg in RE_CGID.findall(html or ""):
+        slug = cg.strip().lower().replace("_", "-")
+        if slug:
+            out.add("/" + slug)
+    return out
+
+
 def soldout_skus(html):
-    """页面里 <a class="soldout" href=".../SKU.html"> 对应的 SKU 集合。"""
     out = set()
     for tag in RE_A_TAG.findall(html or ""):
         if not re.search(r'class=["\'][^"\']*\bsoldout\b', tag, re.I):
@@ -150,32 +178,46 @@ def soldout_skus(html):
         m = re.search(r'href=["\']([^"\']+)["\']', tag, re.I)
         if not m:
             continue
-        p = _norm_path(m.group(1))
-        if not p:
-            continue
-        pm = RE_PRODUCT.match(p)
-        if pm:
-            out.add(pm.group(1))
+        sku = sku_from_path(_norm_path(m.group(1)) or "")
+        if sku:
+            out.add(sku)
     return out
 
 
 def products_from(paths):
     found = {}
     for p in paths:
-        m = RE_PRODUCT.match(p)
-        if not m:
+        sku = sku_from_path(p)
+        if not sku:
             continue
         parts = p.strip("/").split("/")
-        found[m.group(1)] = {
-            "cat": parts[0],
-            "name": parts[1].replace("-", " ").upper(),
+        found[sku] = {
+            "cat": parts[0] if len(parts) > 2 else "shop",
+            "name": parts[-2].replace("-", " ").upper(),
             "url": BASE + p,
         }
     return found
 
 
-def categories_from(paths):
-    return {p for p in paths if RE_CATEGORY.match(p) and p not in STATIC_SKIP}
+def sitemap_categories():
+    """从网站自己的 sitemap 里取分类页。"""
+    cats = set()
+    idx = fetch("/sitemap_index.xml")
+    maps = []
+    if idx:
+        maps = [u for u in RE_LOC.findall(idx) if u.lower().endswith(".xml")]
+    if not maps:
+        maps = [BASE + "/sitemap_0.xml"]
+    for mu in maps[:5]:
+        p = _norm_path(mu) or "/sitemap_0.xml"
+        body = fetch(p)
+        if not body:
+            continue
+        for loc in RE_LOC.findall(body):
+            lp = _norm_path(loc)
+            if lp and RE_CATEGORY.match(lp) and lp not in STATIC_SKIP:
+                cats.add(lp)
+    return cats
 
 
 def images_from(html):
@@ -204,7 +246,7 @@ def push(title, body, click=None, priority="high", tags="shopping_bags"):
         return
     req = urllib.request.Request("%s/%s" % (NTFY_SERVER, NTFY_TOPIC),
                                  data=body.encode("utf-8"), method="POST")
-    req.add_header("Title", title)      # ASCII only
+    req.add_header("Title", title)
     req.add_header("Priority", priority)
     req.add_header("Tags", tags)
     if click:
@@ -237,14 +279,24 @@ def main():
         print("[error] 首页抓不到，本次不更新状态", file=sys.stderr)
         return
 
-    htmls = [home]
-    home_paths = internal_paths(home)
-    cats = categories_from(home_paths)
-    print("[info] 首页发现 %d 个分类: %s" % (len(cats), ", ".join(sorted(cats))))
+    # --- 分类发现：首页 + /shop + sitemap ---
+    cats = {p for p in internal_paths(home) if RE_CATEGORY.match(p) and p not in STATIC_SKIP}
+    cats |= cgid_categories(home)
 
+    shop = fetch("/shop")
+    if shop:
+        cats |= {p for p in internal_paths(shop) if RE_CATEGORY.match(p) and p not in STATIC_SKIP}
+        cats |= cgid_categories(shop)
+
+    cats |= sitemap_categories()
+    cats = {c for c in cats if c not in STATIC_SKIP}
+    print("[info] 共发现 %d 个分类: %s" % (len(cats), ", ".join(sorted(cats))))
+
+    htmls = [home] + ([shop] if shop else [])
     for cat in sorted(cats):
         html = fetch(cat)
         if html is None:
+            print("[info] %s: 打不开，跳过" % cat)
             continue
         htmls.append(html)
         cp = internal_paths(html)
@@ -268,39 +320,30 @@ def main():
           % (len(products), len(soldout_all), len(page_paths)))
 
     if not products:
-        print("[error] 没抓到任何商品（可能被挡或结构变了），本次不更新状态", file=sys.stderr)
+        print("[error] 没抓到任何商品，本次不更新状态", file=sys.stderr)
         return
 
     images = images_from(home) if WATCH_BANNER else set()
 
-    # 首次运行：只记录，不推送
     if not known_products and not links_known:
         save_state({"products": products, "links": sorted(page_paths),
                     "images": sorted(images), "updated": int(time.time())})
-        print("[seed] 已记录 %d 个商品（售罄 %d）、%d 个页面，首次不推送。"
-              % (len(products), len(soldout_all), len(page_paths)))
+        print("[seed] 已记录 %d 个商品，首次不推送。" % len(products))
         return
 
-    # 1) 新商品
     new_skus = [k for k in products if k not in known_products]
 
-    # 2) 到货：之前明确售罄，现在有货
     restocked = []
     for sku, pr in products.items():
         prev = known_products.get(sku)
-        if not prev:
-            continue
-        if prev.get("sold_out") is True and pr["sold_out"] is False:
+        if prev and prev.get("sold_out") is True and pr["sold_out"] is False:
             restocked.append(sku)
 
-    # 3) 新页面
     if links_known:
         new_links = [p for p in page_paths if p not in known_links]
     else:
         new_links = []
-        print("[info] 首次记录页面清单，本次不推送新页面")
 
-    # 4) banner
     new_images = []
     if WATCH_BANNER and known_images:
         new_images = [i for i in images if i not in known_images]
@@ -319,7 +362,7 @@ def main():
     else:
         for sku in new_skus:
             pr = products[sku]
-            tag = "（售罄）" if pr["sold_out"] else ""
+            tag = "（已售罄）" if pr["sold_out"] else ""
             print("[NEW-PRODUCT] %s %s %s" % (sku, pr["name"], pr["url"]))
             push("Chrome Hearts NEW: %s" % pr["cat"],
                  "上新了！%s\n%s\n%s" % (tag, pr["name"], pr["url"]), click=pr["url"])
@@ -336,10 +379,8 @@ def main():
                  click=BASE + pp)
 
     if new_images:
-        print("[NEW-BANNER] %d 张新图" % len(new_images))
         push("Chrome Hearts homepage changed",
-             "官网首页主视觉换了，可能有新动作：\n%s" % BASE,
-             click=BASE, priority="default")
+             "官网首页主视觉换了：\n%s" % BASE, click=BASE, priority="default")
 
     known_products.update(products)
     save_state({"products": known_products,
