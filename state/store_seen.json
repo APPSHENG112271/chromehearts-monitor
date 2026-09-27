@@ -64,7 +64,7 @@
       "cat": "baccarat",
       "name": "WINE",
       "url": "https://www.chromehearts.com/baccarat/wine/177733CRYXXX042.html",
-      "sold_out": false
+      "sold_out": true
     },
     "177731CRYXXX042": {
       "cat": "baccarat",
@@ -255,5 +255,5 @@
     "/socks"
   ],
   "images": [],
-  "updated": 1790539671
+  "updated": 1790549997
 }
