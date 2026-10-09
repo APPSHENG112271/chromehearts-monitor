@@ -214,7 +214,7 @@
       "cat": "socks",
       "name": "STENCIL SOCKS",
       "url": "https://www.chromehearts.com/socks/stencil-socks/176354MB3XXX465.html",
-      "sold_out": true
+      "sold_out": false
     },
     "175740XXXXXX274": {
       "cat": "scents",
@@ -309,5 +309,5 @@
     "/socks"
   ],
   "images": [],
-  "updated": 1791539921
+  "updated": 1791564854
 }
