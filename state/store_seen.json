@@ -70,7 +70,7 @@
       "cat": "baccarat",
       "name": "CHAMPAGNE FLUTE",
       "url": "https://www.chromehearts.com/baccarat/champagne-flute/177731CRYXXX042.html",
-      "sold_out": false
+      "sold_out": true
     },
     "162045CRYXXX274": {
       "cat": "scents",
@@ -309,5 +309,5 @@
     "/socks"
   ],
   "images": [],
-  "updated": 1792143879
+  "updated": 1792160429
 }
