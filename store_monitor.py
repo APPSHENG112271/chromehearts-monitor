@@ -30,7 +30,10 @@ Chrome Hearts 官网监控。
   - 首页连续抓不到 BLIND_ALERT_AFTER 次会推一条"监控失明"提醒，恢复后再推一条
   - 首页抓不到 / 没抓到商品时退出码为 1
 
-环境变量：NTFY_TOPIC / NTFY_SERVER / PROXY_URL / WATCH_BANNER / STATE_PATH
+推送范围：只推服装类。baccarat / scents / eyewear / slippers 等非服装分类静默记录，
+不推送（MUTE_CATS 可改）。
+
+环境变量：NTFY_TOPIC / NTFY_SERVER / PROXY_URL / WATCH_BANNER / STATE_PATH / MUTE_CATS
 用法：python store_monitor.py [run|testpush]
 """
 import json
@@ -84,8 +87,28 @@ RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
 RE_NEXT = re.compile(r'Search-UpdateGrid\?[^"\']*?start=(\d+)(?:&amp;|&)sz=(\d+)', re.I)
 MAX_PAGES = 10               # 单个分类最多翻几页，防止死循环
 
+# 只关心服装：这些非服装分类的上新/到货/新页面只记录、不推送。
+# 其余（包括没见过的新分类）一律推送，避免漏掉新 drop。
+# 可用环境变量 MUTE_CATS（逗号分隔）覆盖；设为空字符串表示全部都推。
+MUTE_CATS = {c.strip().lower() for c in
+             os.environ.get("MUTE_CATS", "baccarat,scents,eyewear,slippers").split(",") if c.strip()}
+MUTE_WORDS = ("PERFUME", "CANDLE", "INCENSE", "SOAP", "MATCHSTICK", "ASHTRAY", "DECANTER",
+              "TUMBLER", "GLASS", "FLUTE", "MARTINI", "SLIPPER", "SUNGLASS")
+
 START = time.time()
 FAILED = set()   # 本次运行中重试后仍然抓不到的路径（404 不算）
+
+
+def is_muted(pr):
+    """非服装类商品：所在分类在 MUTE_CATS 里，或名称含 MUTE_WORDS 里的词。"""
+    if pr.get("cat") in MUTE_CATS:
+        return True
+    name = (pr.get("name") or "").upper()
+    return any(w in name for w in MUTE_WORDS)
+
+
+def link_muted(path):
+    return path.strip("/").split("/")[0] in MUTE_CATS
 
 
 def sku_from_path(p):
@@ -456,6 +479,17 @@ def main():
         new_links = [p for p in page_paths if p not in known_links]
     else:
         new_links = []
+
+    # 非服装类（香水、杯具、眼镜、拖鞋等）只记录、不推送
+    for sku in new_skus + restocked:
+        if is_muted(products[sku]):
+            print("[mute] %s %s（不推送）" % (sku, products[sku]["name"]))
+    new_skus = [s for s in new_skus if not is_muted(products[s])]
+    restocked = [s for s in restocked if not is_muted(products[s])]
+    for pp in new_links:
+        if link_muted(pp):
+            print("[mute] 新页面 %s（不推送）" % pp)
+    new_links = [p for p in new_links if not link_muted(p)]
 
     new_images = []
     if WATCH_BANNER and known_images:
