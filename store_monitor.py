@@ -22,13 +22,21 @@ Chrome Hearts 官网监控。
 遵守 robots.txt：不抓 /on/demandware.store/... 这类被禁止的地址，
 改用其规范别名（cgid=SWEATPANTS -> /sweatpants）。
 
+可靠性：
+  - 抓取失败自动重试；分类页没抓到时沿用该分类商品上次的售罄状态，不误报到货
+  - 推送失败的条目不记入状态，下次运行会重新推送
+  - 状态文件原子写入，并保留 .bak 备份
+  - 首页连续抓不到 BLIND_ALERT_AFTER 次会推一条"监控失明"提醒，恢复后再推一条
+  - 首页抓不到 / 没抓到商品时退出码为 1
+
 环境变量：NTFY_TOPIC / NTFY_SERVER / PROXY_URL / WATCH_BANNER / STATE_PATH
-用法：python store_monitor.py [testpush]
+用法：python store_monitor.py [run|testpush]
 """
 import json
 import os
 import random
 import re
+import shutil
 import ssl
 import sys
 import time
@@ -50,6 +58,10 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
 MAX_PUSH = 8
+RETRY_DELAYS = (2, 5)        # 直连失败后的重试间隔（秒），共 1+2 次尝试
+RETRY_BUDGET = 200           # 本次运行超过这么多秒后不再重试，避免拖过下一个 5 分钟
+PUSH_RETRY_DELAYS = (2, 5, 10)
+BLIND_ALERT_AFTER = 6        # 连续这么多次运行抓不到数据就推提醒（5 分钟一次 ≈ 30 分钟）
 
 STATIC_SKIP = {
     "/", "/login", "/cart", "/checkout", "/contact", "/account", "/search",
@@ -67,6 +79,9 @@ RE_PRODUCT = re.compile(r'^/(?:[A-Za-z0-9\-]+/){1,2}([A-Za-z0-9]{9,})\.html$')
 # 分类/页面：1~2 段、不带扩展名
 RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
 RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
+
+START = time.time()
+FAILED = set()   # 本次运行中重试后仍然抓不到的路径（404 不算）
 
 
 def sku_from_path(p):
@@ -112,23 +127,31 @@ def _get(url, opener):
 
 def fetch(path):
     url = BASE + path if path.startswith("/") else path
-    try:
-        return _get(url, _opener(""))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        print("[info] %s 直连失败(HTTP %s)，改走代理" % (path, e.code), file=sys.stderr)
-    except Exception as e:
-        print("[info] %s 直连失败(%s)，改走代理" % (path, e), file=sys.stderr)
-    if not PROXY_URL:
-        return None
-    for _ in range(2):
+    err = None
+    for i in range(len(RETRY_DELAYS) + 1):
         try:
-            sessid = str(random.randint(10 ** 6, 10 ** 9))
-            return _get(url, _opener(_proxy_with_session(PROXY_URL, sessid)))
+            return _get(url, _opener(""))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            err = "HTTP %s" % e.code
         except Exception as e:
-            print("[retry] %s 代理抓取失败: %s" % (path, e), file=sys.stderr)
-            time.sleep(3)
+            err = str(e)
+        if i < len(RETRY_DELAYS) and time.time() - START < RETRY_BUDGET:
+            time.sleep(RETRY_DELAYS[i])
+        else:
+            break
+    print("[info] %s 直连失败(%s)%s" % (path, err, "，改走代理" if PROXY_URL else ""),
+          file=sys.stderr)
+    if PROXY_URL:
+        for _ in range(2):
+            try:
+                sessid = str(random.randint(10 ** 6, 10 ** 9))
+                return _get(url, _opener(_proxy_with_session(PROXY_URL, sessid)))
+            except Exception as e:
+                print("[retry] %s 代理抓取失败: %s" % (path, e), file=sys.stderr)
+                time.sleep(3)
+    FAILED.add(path)
     return None
 
 
@@ -226,58 +249,93 @@ def images_from(html):
 
 # ---------- 状态 / 推送 ----------
 
+def _bak_path():
+    return STATE_PATH.with_name(STATE_PATH.name + ".bak")
+
+
 def load_state():
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+    for p in (STATE_PATH, _bak_path()):
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                print("[warn] 状态文件 %s 读取失败: %s" % (p, e), file=sys.stderr)
     return {}
 
 
 def save_state(state):
+    """原子写入：先写临时文件再替换；替换前把当前完好的状态备份成 .bak。"""
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    if STATE_PATH.exists():
+        try:
+            json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            shutil.copyfile(STATE_PATH, _bak_path())
+        except Exception:
+            pass
+    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
 
 
 def push(title, body, click=None, priority="high", tags="shopping_bags"):
+    """推送成功返回 True；失败（重试后仍失败）返回 False。未配置 topic 视为无需推送。"""
     if not NTFY_TOPIC:
         print("[warn] 未设置 NTFY_TOPIC，跳过推送", file=sys.stderr)
-        return
-    req = urllib.request.Request("%s/%s" % (NTFY_SERVER, NTFY_TOPIC),
-                                 data=body.encode("utf-8"), method="POST")
-    req.add_header("Title", title)
-    req.add_header("Priority", priority)
-    req.add_header("Tags", tags)
-    if click:
-        req.add_header("Click", click)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            r.read()
-        print("[push] 已推送: %s" % title)
-    except Exception as e:
-        print("[error] 推送失败: %s" % e, file=sys.stderr)
+        return True
+    for i in range(len(PUSH_RETRY_DELAYS) + 1):
+        req = urllib.request.Request("%s/%s" % (NTFY_SERVER, NTFY_TOPIC),
+                                     data=body.encode("utf-8"), method="POST")
+        req.add_header("Title", title)
+        req.add_header("Priority", priority)
+        req.add_header("Tags", tags)
+        if click:
+            req.add_header("Click", click)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+            print("[push] 已推送: %s" % title)
+            return True
+        except Exception as e:
+            print("[error] 推送失败(第 %d 次): %s" % (i + 1, e), file=sys.stderr)
+            if i < len(PUSH_RETRY_DELAYS):
+                time.sleep(PUSH_RETRY_DELAYS[i])
+    return False
 
 
 # ---------- 主流程 ----------
 
+def blind(state, reason):
+    """本次没抓到有效数据：累计连续失败次数，达到阈值推一次提醒。返回退出码 1。"""
+    print("[error] %s，本次不更新状态" % reason, file=sys.stderr)
+    streak = int(state.get("fail_streak", 0)) + 1
+    state["fail_streak"] = streak
+    if streak == BLIND_ALERT_AFTER:
+        ok = push("Chrome Hearts monitor: blind",
+                  "监控已连续 %d 次抓不到官网数据（%s），期间的上新/到货可能漏掉。"
+                  % (streak, reason), priority="default", tags="warning")
+        if not ok:
+            state["fail_streak"] = streak - 1   # 提醒没发出去，下次再试
+    save_state(state)
+    return 1
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "testpush":
-        push("Chrome Hearts store monitor - test",
-             "测试成功！上新 / 到货都会这样推给你，点开直达商品页。",
-             click=BASE, priority="default")
-        return
+        ok = push("Chrome Hearts store monitor - test",
+                  "测试成功！上新 / 到货都会这样推给你，点开直达商品页。",
+                  click=BASE, priority="default")
+        return 0 if ok else 1
 
     state = load_state()
     known_products = state.get("products") or state.get("skus") or {}
     known_links = set(state.get("links") or [])
     links_known = bool(state.get("links"))
     known_images = set(state.get("images") or [])
+    prev_streak = int(state.get("fail_streak", 0))
 
     home = fetch("/")
     if home is None:
-        print("[error] 首页抓不到，本次不更新状态", file=sys.stderr)
-        return
+        return blind(state, "首页抓不到")
 
     # --- 分类发现：首页 + /shop + sitemap ---
     cats = {p for p in internal_paths(home) if RE_CATEGORY.match(p) and p not in STATIC_SKIP}
@@ -310,26 +368,42 @@ def main():
         all_paths |= internal_paths(h)
         soldout_all |= soldout_skus(h)
 
+    # 售罄标记只在分类页上可靠；分类页没抓到时，沿用上次的状态，避免误报到货
+    failed_pages = {p for p in FAILED if not p.startswith("/sitemap")}
+
     products = products_from(all_paths)
-    for sku in products:
-        products[sku]["sold_out"] = sku in soldout_all
+    for sku, pr in products.items():
+        pr["sold_out"] = sku in soldout_all
+        prev = known_products.get(sku)
+        cat_failed = ("/" + pr["cat"]) in failed_pages or (pr["cat"] == "shop" and bool(failed_pages))
+        if prev and cat_failed and "sold_out" in prev:
+            pr["sold_out"] = prev["sold_out"]
 
     page_paths = {p for p in all_paths
                   if RE_PAGE.match(p) and p not in STATIC_SKIP and "/on/" not in p}
     print("[info] 合计商品 %d 个（售罄 %d），页面 %d 个"
           % (len(products), len(soldout_all), len(page_paths)))
+    if failed_pages:
+        print("[info] 本次有 %d 个页面抓取失败，相关商品沿用上次售罄状态: %s"
+              % (len(failed_pages), ", ".join(sorted(failed_pages))))
 
     if not products:
-        print("[error] 没抓到任何商品，本次不更新状态", file=sys.stderr)
-        return
+        return blind(state, "没抓到任何商品")
+
+    # 数据恢复正常：之前发过"失明"提醒的话，告知一声
+    if prev_streak >= BLIND_ALERT_AFTER:
+        push("Chrome Hearts monitor: recovered",
+             "监控已恢复正常（此前连续 %d 次抓不到数据）。" % prev_streak,
+             priority="default", tags="white_check_mark")
 
     images = images_from(home) if WATCH_BANNER else set()
 
     if not known_products and not links_known:
         save_state({"products": products, "links": sorted(page_paths),
-                    "images": sorted(images), "updated": int(time.time())})
+                    "images": sorted(images), "updated": int(time.time()),
+                    "fail_streak": 0})
         print("[seed] 已记录 %d 个商品，首次不推送。" % len(products))
-        return
+        return 0
 
     new_skus = [k for k in products if k not in known_products]
 
@@ -350,44 +424,62 @@ def main():
 
     total = len(new_skus) + len(restocked) + len(new_links)
 
+    # 没推送成功的条目不记入状态，下次运行会再推一次
+    unsent_new, unsent_restock, unsent_links = set(), set(), set()
+
     if total == 0:
         print("[ok] 没有变化（已知商品 %d 个，其中售罄 %d）"
               % (len(known_products), len(soldout_all)))
     elif total > MAX_PUSH:
         print("[WARN] 一次出现 %d 处变化，合并成一条推送" % total)
-        push("Chrome Hearts: %d changes" % total,
-             "官网出现 %d 处变化（新品 %d、到货 %d、新页面 %d）：\n%s"
-             % (total, len(new_skus), len(restocked), len(new_links), BASE),
-             click=BASE)
+        if not push("Chrome Hearts: %d changes" % total,
+                    "官网出现 %d 处变化（新品 %d、到货 %d、新页面 %d）：\n%s"
+                    % (total, len(new_skus), len(restocked), len(new_links), BASE),
+                    click=BASE):
+            unsent_new, unsent_restock, unsent_links = set(new_skus), set(restocked), set(new_links)
     else:
         for sku in new_skus:
             pr = products[sku]
             tag = "（已售罄）" if pr["sold_out"] else ""
             print("[NEW-PRODUCT] %s %s %s" % (sku, pr["name"], pr["url"]))
-            push("Chrome Hearts NEW: %s" % pr["cat"],
-                 "上新了！%s\n%s\n%s" % (tag, pr["name"], pr["url"]), click=pr["url"])
+            if not push("Chrome Hearts NEW: %s" % pr["cat"],
+                        "上新了！%s\n%s\n%s" % (tag, pr["name"], pr["url"]), click=pr["url"]):
+                unsent_new.add(sku)
         for sku in restocked:
             pr = products[sku]
             print("[RESTOCK] %s %s %s" % (sku, pr["name"], pr["url"]))
-            push("Chrome Hearts RESTOCK: %s" % pr["cat"],
-                 "到货了！之前售罄的这件重新有货：\n%s\n%s" % (pr["name"], pr["url"]),
-                 click=pr["url"], tags="rotating_light")
+            if not push("Chrome Hearts RESTOCK: %s" % pr["cat"],
+                        "到货了！之前售罄的这件重新有货：\n%s\n%s" % (pr["name"], pr["url"]),
+                        click=pr["url"], tags="rotating_light"):
+                unsent_restock.add(sku)
         for pp in sorted(new_links):
             print("[NEW-PAGE] %s" % pp)
-            push("Chrome Hearts NEW PAGE",
-                 "官网出现新页面（可能是新系列/新 drop）：\n%s%s" % (BASE, pp),
-                 click=BASE + pp)
+            if not push("Chrome Hearts NEW PAGE",
+                        "官网出现新页面（可能是新系列/新 drop）：\n%s%s" % (BASE, pp),
+                        click=BASE + pp):
+                unsent_links.add(pp)
+
+    if unsent_new or unsent_restock or unsent_links:
+        print("[warn] 有 %d 条推送失败，不记入状态，下次运行重试"
+              % (len(unsent_new) + len(unsent_restock) + len(unsent_links)), file=sys.stderr)
 
     if new_images:
         push("Chrome Hearts homepage changed",
              "官网首页主视觉换了：\n%s" % BASE, click=BASE, priority="default")
 
-    known_products.update(products)
+    to_save = dict(products)
+    for sku in unsent_new:
+        to_save.pop(sku, None)
+    for sku in unsent_restock:
+        to_save[sku] = known_products[sku]      # 保持"售罄"，下次仍判定为到货
+    known_products.update(to_save)
     save_state({"products": known_products,
-                "links": sorted(set(known_links) | page_paths),
+                "links": sorted((known_links | page_paths) - unsent_links),
                 "images": sorted(set(known_images) | images),
-                "updated": int(time.time())})
+                "updated": int(time.time()),
+                "fail_streak": 0})
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
