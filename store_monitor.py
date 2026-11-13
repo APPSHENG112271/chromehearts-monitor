@@ -63,7 +63,9 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 
 MAX_PUSH = 8
 RETRY_DELAYS = (2, 5)        # 直连失败后的重试间隔（秒），共 1+2 次尝试
-RETRY_BUDGET = 200           # 本次运行超过这么多秒后不再重试，避免拖过下一个 5 分钟
+RETRY_BUDGET = 150           # 本次运行超过这么多秒后不再重试，避免拖过下一个 5 分钟
+HARD_DEADLINE = 240          # 超过这么多秒后不再发起新的抓取，保证一轮在 5 分钟内结束
+REQUEST_TIMEOUT = 25         # 单次请求超时（秒）
 PUSH_RETRY_DELAYS = (2, 5, 10)
 BLIND_ALERT_AFTER = 6        # 连续这么多次运行抓不到数据就推提醒（5 分钟一次 ≈ 30 分钟）
 
@@ -148,13 +150,17 @@ def _get(url, opener):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    with opener.open(req, timeout=40) as r:
+    with opener.open(req, timeout=REQUEST_TIMEOUT) as r:
         return r.read().decode("utf-8", "ignore")
 
 
 def fetch(path):
     url = BASE + path if path.startswith("/") else path
     err = None
+    if time.time() - START > HARD_DEADLINE:
+        print("[info] %s 超过本次运行时限(%d 秒)，放弃" % (path, HARD_DEADLINE), file=sys.stderr)
+        FAILED.add(path)
+        return None
     for i in range(len(RETRY_DELAYS) + 1):
         try:
             return _get(url, _opener(""))
@@ -267,6 +273,9 @@ def sitemap_categories():
             lp = _norm_path(loc)
             if lp and RE_CATEGORY.match(lp) and lp not in STATIC_SKIP:
                 cats.add(lp)
+        # sitemap 里有些分类只以 Search-Show?cgid=XXX 的形式出现（如 SWEATPANTS），
+        # 转成规范地址 /xxx，这样没被首页链接的分类也会被检查
+        cats |= cgid_categories(body)
     return cats
 
 
@@ -555,4 +564,6 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    rc = main() or 0
+    print("[done] 用时 %.1f 秒，抓取失败页面 %d 个" % (time.time() - START, len(FAILED)))
+    sys.exit(rc)
