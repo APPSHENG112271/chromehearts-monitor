@@ -25,6 +25,7 @@ Chrome Hearts 官网监控。
 可靠性：
   - 抓取失败自动重试；分类页没抓到时沿用该分类商品上次的售罄状态，不误报到货
   - 推送失败的条目不记入状态，下次运行会重新推送
+  - 分类页自动翻页（show more），不再只看每个分类的前 12 个商品
   - 状态文件原子写入，并保留 .bak 备份
   - 首页连续抓不到 BLIND_ALERT_AFTER 次会推一条"监控失明"提醒，恢复后再推一条
   - 首页抓不到 / 没抓到商品时退出码为 1
@@ -79,6 +80,9 @@ RE_PRODUCT = re.compile(r'^/(?:[A-Za-z0-9\-]+/){1,2}([A-Za-z0-9]{9,})\.html$')
 # 分类/页面：1~2 段、不带扩展名
 RE_PAGE = re.compile(r'^/[a-z0-9\-]{2,}(?:/[a-z0-9\-]{2,})?$')
 RE_CATEGORY = re.compile(r'^/[a-z0-9\-]{2,}$')
+# "show more" 按钮里的下一页参数：...Search-UpdateGrid?cgid=xxx&start=12&sz=12
+RE_NEXT = re.compile(r'Search-UpdateGrid\?[^"\']*?start=(\d+)(?:&amp;|&)sz=(\d+)', re.I)
+MAX_PAGES = 10               # 单个分类最多翻几页，防止死循环
 
 START = time.time()
 FAILED = set()   # 本次运行中重试后仍然抓不到的路径（404 不算）
@@ -247,6 +251,36 @@ def images_from(html):
     return set(RE_IMG.findall(html or ""))
 
 
+def fetch_category(cat):
+    """抓取一个分类的所有分页，返回 html 列表；第一页打不开返回 None。
+
+    分类页只带前 12 个商品，其余靠"show more"按钮加载。按钮指向的接口在
+    /on/demandware.store/ 下（robots.txt 禁止），改用同样有效的规范地址
+    /分类?start=N&sz=M 翻页。后续页抓失败时把该分类记为不完整（FAILED）。
+    """
+    first = fetch(cat)
+    if first is None:
+        return None
+    pages = [first]
+    seen = set()
+    html = first
+    while len(pages) < MAX_PAGES:
+        m = RE_NEXT.search(html)
+        if not m:
+            break
+        start, size = int(m.group(1)), int(m.group(2))
+        if start in seen:
+            break
+        seen.add(start)
+        time.sleep(1)
+        html = fetch("%s?start=%d&sz=%d" % (cat, start, size))
+        if html is None:
+            FAILED.add(cat)
+            break
+        pages.append(html)
+    return pages
+
+
 # ---------- 状态 / 推送 ----------
 
 def _bak_path():
@@ -341,8 +375,8 @@ def main():
     cats = {p for p in internal_paths(home) if RE_CATEGORY.match(p) and p not in STATIC_SKIP}
     cats |= cgid_categories(home)
 
-    shop = fetch("/shop")
-    if shop:
+    shop_pages = fetch_category("/shop") or []
+    for shop in shop_pages:
         cats |= {p for p in internal_paths(shop) if RE_CATEGORY.match(p) and p not in STATIC_SKIP}
         cats |= cgid_categories(shop)
 
@@ -350,16 +384,21 @@ def main():
     cats = {c for c in cats if c not in STATIC_SKIP}
     print("[info] 共发现 %d 个分类: %s" % (len(cats), ", ".join(sorted(cats))))
 
-    htmls = [home] + ([shop] if shop else [])
+    htmls = [home] + shop_pages
     for cat in sorted(cats):
-        html = fetch(cat)
-        if html is None:
+        pages = fetch_category(cat)
+        if pages is None:
             print("[info] %s: 打不开，跳过" % cat)
             continue
-        htmls.append(html)
-        cp = internal_paths(html)
-        print("[info] %s: 商品 %d 个，售罄 %d 个"
-              % (cat, len(products_from(cp)), len(soldout_skus(html))))
+        htmls.extend(pages)
+        cp = set()
+        sold = set()
+        for h in pages:
+            cp |= internal_paths(h)
+            sold |= soldout_skus(h)
+        print("[info] %s: 商品 %d 个，售罄 %d 个%s"
+              % (cat, len(products_from(cp)), len(sold),
+                 "（共 %d 页）" % len(pages) if len(pages) > 1 else ""))
         time.sleep(1)
 
     all_paths = set()
